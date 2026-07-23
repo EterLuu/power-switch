@@ -12,7 +12,7 @@
 #===============================================================================
 set -u
 
-PSW_VERSION="1.0.0"
+PSW_VERSION="1.1.0"
 
 #-------------------------------------------------------------------------------
 # 基础工具
@@ -48,8 +48,12 @@ confirm() { # confirm <提示> — 返回 0 表示确认
     case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
-lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
 upper() { printf '%s' "$1" | tr 'a-z' 'A-Z'; }
+
+# require_option_value <选项> <剩余参数个数>
+require_option_value() {
+    [ "$2" -ge 2 ] || die "参数 '$1' 缺少值"
+}
 
 # disp_width <字符串> — 估算终端显示宽度（ASCII=1，多字节字符=2）
 disp_width() {
@@ -69,6 +73,38 @@ pw() {
     printf '%*s' "$pad" ''
 }
 
+# clip_text <文本> <显示宽度> — 超长时从右侧截断并添加省略号
+clip_text() {
+    local s="$1" max="$2" w out="" limit used=0 i=0 len ch cw
+    [ "$max" -gt 0 ] || return 0
+    w=$(disp_width "$s")
+    if [ "$w" -le "$max" ]; then
+        printf '%s' "$s"
+        return 0
+    fi
+    limit=$((max - 1))
+    [ "$limit" -lt 0 ] && limit=0
+    len=${#s}
+    while [ "$i" -lt "$len" ]; do
+        ch=${s:$i:1}
+        case "$ch" in ' '|[!-~]) cw=1 ;; *) cw=2 ;; esac
+        [ $((used + cw)) -gt "$limit" ] && break
+        out="$out$ch"
+        used=$((used + cw))
+        i=$((i+1))
+    done
+    printf '%s…' "$out"
+}
+
+# repeat_text <文本> <次数>
+repeat_text() {
+    local text="$1" count="$2" i=0
+    while [ "$i" -lt "$count" ]; do
+        printf '%s' "$text"
+        i=$((i+1))
+    done
+}
+
 # 校验接入商名称（作为文件名与 TOML/YAML 标识符使用）
 valid_name() {
     case "$1" in
@@ -83,6 +119,9 @@ shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # TOML 双引号字符串转义
 toml_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
+# YAML 双引号字符串转义
+yaml_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
 # 简易 key=value 读取（不 eval，避免注入）
 kv_get() { # kv_get <file> <key>
     [ -f "$1" ] || return 1
@@ -91,12 +130,19 @@ kv_get() { # kv_get <file> <key>
 
 backup_file() { # backup_file <path> — 写入前备份
     [ -f "$1" ] || return 0
-    cp -p "$1" "$1.psw-bak-$(date +%Y%m%d%H%M%S)"
+    local base dest i=1
+    base="$1.psw-bak-$(date +%Y%m%d%H%M%S)"
+    dest="$base"
+    while [ -e "$dest" ]; do
+        dest="$base-$i"
+        i=$((i+1))
+    done
+    cp -p "$1" "$dest" || die "无法备份配置文件: $1"
 }
 
 atomic_mv() { # atomic_mv <tmp> <dest>
     chmod 600 "$1" 2>/dev/null
-    mv -f "$1" "$2"
+    mv -f "$1" "$2" || die "无法写入配置文件: $2"
 }
 
 mktmp() { mktemp "${TMPDIR:-/tmp}/psw.XXXXXX"; }
@@ -146,7 +192,8 @@ require_json_backend() {
 # json_env_merge <file> "K=V"... — 合并写入顶层 .env 对象（保留文件其余内容）
 json_env_merge() {
     local file="$1"; shift
-    local backend; backend=$(json_backend)
+    local backend
+    backend=$(json_backend) || die "编辑 JSON 配置需要 jq、python3 或 node 中的任意一个，请先安装。"
     [ -f "$file" ] || printf '{}\n' > "$file"
     backup_file "$file"
     local tmp; tmp=$(mktmp)
@@ -197,7 +244,8 @@ JSEOF
 json_env_delete() {
     local file="$1"; shift
     [ -f "$file" ] || return 0
-    local backend; backend=$(json_backend)
+    local backend
+    backend=$(json_backend) || die "编辑 JSON 配置需要 jq、python3 或 node 中的任意一个，请先安装。"
     backup_file "$file"
     local tmp; tmp=$(mktmp)
     case "$backend" in
@@ -239,7 +287,8 @@ JSEOF
 # opencode_apply <file> <provider_id> <npm包> <显示名> <base_url> <api_key> <model>
 opencode_apply() {
     local file="$1" pid="$2" npm="$3" disp="$4" bu="$5" ak="$6" model="$7"
-    local backend; backend=$(json_backend)
+    local backend
+    backend=$(json_backend) || die "编辑 JSON 配置需要 jq、python3 或 node 中的任意一个，请先安装。"
     if [ ! -f "$file" ]; then
         mkdir -p "$(dirname "$file")"
         printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > "$file"
@@ -299,7 +348,8 @@ JSEOF
 opencode_off() {
     local file="$1" pid="$2"
     [ -f "$file" ] || return 0
-    local backend; backend=$(json_backend)
+    local backend
+    backend=$(json_backend) || die "编辑 JSON 配置需要 jq、python3 或 node 中的任意一个，请先安装。"
     backup_file "$file"
     local tmp; tmp=$(mktmp)
     case "$backend" in
@@ -388,14 +438,30 @@ provider_list_names() {
     done
 }
 
-# 接入商环境变量名（Codex env_key 等使用）: PSW_<NAME>_API_KEY
+# 接入商环境变量名（Codex env_key 等使用）。
+# 将合法的 ASCII 名称逐字节编码为十六进制，避免 foo-bar、foo_bar、Foo、foo
+# 等名称在区分或不区分环境变量大小写的平台上发生碰撞。
 provider_env_key() {
+    local s="$1" out="" i=0 len ch hex
+    len=${#s}
+    while [ "$i" -lt "$len" ]; do
+        ch=${s:$i:1}
+        hex=$(printf '%02X' "'$ch")
+        out="${out}${hex}"
+        i=$((i+1))
+    done
+    printf 'PSW2_%s_API_KEY' "$out"
+}
+
+# 1.0.x 使用的旧环境变量名，仅用于为无歧义名称生成迁移兼容别名。
+provider_legacy_env_key() {
     printf 'PSW_%s_API_KEY' "$(upper "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/_/g')")"
 }
 
 # Codex 内 provider id: psw_<name>
 provider_codex_id() {
-    printf 'psw_%s' "$(lower "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/_/g')")"
+    # valid_name 已保证名称只含 TOML bare-key 允许的字符，直接保留即可避免碰撞。
+    printf 'psw_%s' "$1"
 }
 
 # 重新生成 env.sh（导出所有接入商的 key 环境变量 + source agent env 文件）
@@ -408,11 +474,28 @@ regen_env_file() {
     local tmp; tmp=$(mktmp)
     {
         printf '# 由 power-switch 自动生成，请勿手改 (v%s)\n' "$PSW_VERSION"
-        local n
-        for n in $(provider_list_names); do
+        local names=() n m api_key env_key legacy_key legacy_count
+        for n in $(provider_list_names); do names+=("$n"); done
+        for n in "${names[@]}"; do
             provider_load "$n" || continue
             [ -n "$P_API_KEY" ] || continue
-            printf 'export %s=%s\n' "$(provider_env_key "$n")" "$(shq "$P_API_KEY")"
+            api_key="$P_API_KEY"
+            env_key=$(provider_env_key "$n")
+            legacy_key=$(provider_legacy_env_key "$n")
+            printf 'export %s=%s\n' "$env_key" "$(shq "$api_key")"
+            if [ "$legacy_key" != "$env_key" ]; then
+                legacy_count=0
+                for m in "${names[@]}"; do
+                    [ "$(provider_legacy_env_key "$m")" = "$legacy_key" ] && \
+                        legacy_count=$((legacy_count+1))
+                done
+                if [ "$legacy_count" -eq 1 ]; then
+                    printf 'export %s=%s # 兼容 power-switch 1.0.x\n' \
+                        "$legacy_key" "$(shq "$api_key")"
+                else
+                    printf '# 未生成有歧义的旧变量名: %s\n' "$legacy_key"
+                fi
+            fi
         done
         local e
         for e in "$ENV_DIR"/*.sh; do
@@ -542,7 +625,7 @@ cmd_provider_show() {
     printf '%s %s %s\n' "${C_CYN}│${C_RST}" "$(pw "API Key" 12)" "$masked"
     printf '%s %s %s\n' "${C_CYN}│${C_RST}" "$(pw "主模型" 12)" "$P_MODEL"
     printf '%s %s %s\n' "${C_CYN}│${C_RST}" "$(pw "小/快模型" 12)" "$P_SMALL_MODEL"
-    printf '%s %s %s\n' "${C_CYN}│${C_RST}" "$(pw "Codex wire" 12)" "$P_WIRE_API"
+    printf '%s %s %s\n' "${C_CYN}│${C_RST}" "$(pw "OpenAI API" 12)" "$P_WIRE_API"
     printf '%s %s %b\n' "${C_CYN}│${C_RST}" "$(pw "状态" 12)" "$st_badge"
     printf '%s %s %s\n' "${C_CYN}│${C_RST}" "$(pw "环境变量" 12)" "$(provider_env_key "$name")"
     printf '%s\n' "${C_CYN}└─${C_RST}"
@@ -553,6 +636,11 @@ cmd_provider_add() {
     ensure_dirs
     local name="" preset="" format="" base_url="" api_key="" model="" small_model="" wire_api="responses"
     while [ $# -gt 0 ]; do
+        case "$1" in
+            --name|--preset|--format|--base-url|--key|--model|--small-model|--wire-api)
+                require_option_value "$1" "$#"
+                ;;
+        esac
         case "$1" in
             --name)       name="$2"; shift 2 ;;
             --preset)     preset="$2"; shift 2 ;;
@@ -565,6 +653,7 @@ cmd_provider_add() {
             *) die "未知参数: $1" ;;
         esac
     done
+    case "$wire_api" in responses|chat) ;; *) die "wire_api 必须是 responses 或 chat" ;; esac
 
     # 名称
     if [ -z "$name" ]; then
@@ -686,16 +775,21 @@ cmd_provider_edit() {
         if [ -n "$v" ]; then
             case "$v" in openai|anthropic) P_FORMAT="$v"; changed=1 ;; *) die "格式必须是 openai 或 anthropic" ;; esac
         fi
-        printf 'Codex wire_api (responses/chat) [%s]: ' "$P_WIRE_API" >&2; read -r v
+        printf 'OpenAI wire_api (responses/chat) [%s]: ' "$P_WIRE_API" >&2; read -r v
         if [ -n "$v" ]; then
             case "$v" in responses|chat) P_WIRE_API="$v"; changed=1 ;; *) die "wire_api 必须是 responses 或 chat" ;; esac
         fi
     else
         while [ $# -gt 0 ]; do
             case "$1" in
+                --format|--base-url|--key|--model|--small-model|--wire-api)
+                    require_option_value "$1" "$#"
+                    ;;
+            esac
+            case "$1" in
                 --format)      case "$2" in openai|anthropic) P_FORMAT="$2" ;; *) die "格式必须是 openai 或 anthropic" ;; esac; shift 2 ;;
                 --base-url)    P_BASE_URL="$2"; shift 2 ;;
-                --key)         P_API_KEY="$2"; shift 2 ;;
+                --key)         if [ "$2" = "-" ]; then P_API_KEY=""; else P_API_KEY="$2"; fi; shift 2 ;;
                 --model)       P_MODEL="$2"; shift 2 ;;
                 --small-model) P_SMALL_MODEL="$2"; shift 2 ;;
                 --wire-api)    case "$2" in responses|chat) P_WIRE_API="$2" ;; *) die "wire_api 必须是 responses 或 chat" ;; esac; shift 2 ;;
@@ -746,7 +840,16 @@ cmd_provider_enable() {
     P_ENABLED="$val"
     provider_save
     regen_env_file
-    if [ "$val" = "1" ]; then ok "接入商 '$name' 已启用"; else ok "接入商 '$name' 已禁用"; fi
+    if [ "$val" = "1" ]; then
+        ok "接入商 '$name' 已启用"
+    else
+        local a active=""
+        for a in $AGENTS; do
+            [ "$(kv_get "$STATE_DIR/$a" PROVIDER 2>/dev/null || true)" = "$name" ] && active="$active $a"
+        done
+        [ -n "$active" ] && warn "已应用到以下 Agent 的配置不会自动失效:$active"
+        ok "接入商 '$name' 已禁用"
+    fi
 }
 
 #-------------------------------------------------------------------------------
@@ -759,11 +862,8 @@ CLAUDE_ENV_KEYS="ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHR
 
 agent_apply_claude() { # 需已 provider_load；$1 = mode (settings|env)
     local mode="$1"
-    if [ "$P_FORMAT" != "anthropic" ]; then
-        warn "Claude Code 只支持 Anthropic Messages 协议。"
-        warn "接入商 '$P_NAME' 是 openai 格式，需经 One-API/LiteLLM 等网关转换为 anthropic 格式后才能使用。"
-        confirm "仍要写入配置吗?" || return 1
-    fi
+    [ "$P_FORMAT" = "anthropic" ] || \
+        die "Claude Code 只支持 Anthropic Messages 协议；请使用 anthropic 格式接入商或协议转换网关"
     case "$mode" in
         settings)
             require_json_backend
@@ -814,7 +914,7 @@ agent_off_claude() {
 # 删除 codex 配置中由 power-switch 管理的部分（psw_* provider 段 + 顶层 model/model_provider）
 codex_strip_managed() { # codex_strip_managed <file> — 输出到 stdout
     awk '
-        /^\[model_providers\.psw_[A-Za-z0-9_]*\][ \t]*$/ { inprov=1; next }
+        /^\[model_providers\.psw_[A-Za-z0-9_-]+\][ \t]*$/ { inprov=1; next }
         /^\[/ { sect="other"; inprov=0; print; next }
         inprov { next }
         sect!="other" && /^[ \t]*model[ \t]*=/          { next }
@@ -824,12 +924,15 @@ codex_strip_managed() { # codex_strip_managed <file> — 输出到 stdout
 }
 
 agent_apply_codex() {
+    [ "$P_FORMAT" = "openai" ] || die "Codex 不支持 Anthropic 原生协议，请使用 OpenAI Responses 兼容端点"
     local cfg; cfg=$(codex_config)
     mkdir -p "$(dirname "$cfg")"
     [ -f "$cfg" ] || : > "$cfg"
     backup_file "$cfg"
     if [ "$P_WIRE_API" = "responses" ]; then
         info "wire_api=responses：Base URL 需支持 OpenAI Responses API (/responses)"
+    else
+        warn "wire_api=chat 仅兼容旧版 Codex；当前版本只接受 responses"
     fi
     local prov_id envk
     prov_id=$(provider_codex_id "$P_NAME")
@@ -874,7 +977,11 @@ agent_apply_opencode() {
     require_json_backend
     local cfg; cfg=$(opencode_config)
     local npm="@ai-sdk/openai-compatible"
-    [ "$P_FORMAT" = "anthropic" ] && npm="@ai-sdk/anthropic"
+    if [ "$P_FORMAT" = "anthropic" ]; then
+        npm="@ai-sdk/anthropic"
+    elif [ "$P_WIRE_API" = "responses" ]; then
+        npm="@ai-sdk/openai"
+    fi
     opencode_apply "$cfg" "$P_NAME" "$npm" "$P_NAME" "$P_BASE_URL" "$P_API_KEY" "$P_MODEL"
     ok "已写入 $cfg (provider: $P_NAME, npm: $npm)，当前模型: $P_NAME/$P_MODEL"
 }
@@ -904,15 +1011,21 @@ agent_apply_hermes() {
     mkdir -p "$(dirname "$cfg")"
     [ -f "$cfg" ] || : > "$cfg"
     backup_file "$cfg"
-    local tmp; tmp=$(mktmp)
+    local tmp api_mode="chat_completions"; tmp=$(mktmp)
+    if [ "$P_FORMAT" = "anthropic" ]; then
+        api_mode="anthropic_messages"
+    elif [ "$P_WIRE_API" = "responses" ]; then
+        api_mode="codex_responses"
+    fi
     {
         hermes_strip_managed "$cfg"
         # 去除尾部空行
         printf 'model:\n'
-        printf '  default: "%s"\n'  "$P_MODEL"
+        printf '  default: "%s"\n'  "$(yaml_str "$P_MODEL")"
         printf '  provider: custom\n'
-        printf '  base_url: "%s"\n' "$P_BASE_URL"
-        printf '  api_key: "%s"\n'  "$P_API_KEY"
+        printf '  base_url: "%s"\n' "$(yaml_str "$P_BASE_URL")"
+        printf '  api_key: "%s"\n'  "$(yaml_str "$P_API_KEY")"
+        printf '  api_mode: "%s"\n' "$api_mode"
     } > "$tmp"
     atomic_mv "$tmp" "$cfg"
     ok "已写入 $cfg (model.default=$P_MODEL, base_url=$P_BASE_URL)"
@@ -949,6 +1062,9 @@ cmd_agent_use() {
     local mode="settings" model_ov="" small_ov=""
     while [ $# -gt 0 ]; do
         case "$1" in
+            --mode|--model|--small-model) require_option_value "$1" "$#" ;;
+        esac
+        case "$1" in
             --mode)        mode="$2"; shift 2 ;;
             --model)       model_ov="$2"; shift 2 ;;
             --small-model) small_ov="$2"; shift 2 ;;
@@ -957,6 +1073,7 @@ cmd_agent_use() {
     done
     case "$mode" in settings|env) ;; *) die "模式必须是 settings 或 env" ;; esac
     agent_exists "$agent" || die "未知 Agent: $agent (支持: $AGENTS)"
+    [ "$agent" = "claude" ] || [ "$mode" = "settings" ] || die "--mode 仅适用于 Claude Code"
     provider_load "$provider" || die "接入商 '$provider' 不存在，先用 'psw provider add' 添加"
     if [ "$P_ENABLED" != "1" ]; then
         die "接入商 '$provider' 已禁用，先执行: psw provider enable $provider"
@@ -1208,21 +1325,96 @@ DS_AGENT=""
 DS_PROVIDER=""
 DS_MSG=""
 DS_STTY=""
+DS_WIDTH=80
+DS_PAD_X_ACTIVE=2
+DS_TOO_SMALL=0
+DS_CONTENT_LINES=0
+DS_LAST_CONTENT_LINES=0
+DS_ACTIVE_CONTENT_KEY=""
+DS_LAST_CONTENT_KEY=""
+DS_ROWS=24
+DS_LAST_TOP_BAR_KEY=""
+DS_LAST_TOP_RULE_LAYOUT=""
+DS_LAST_FOOTER_LAYOUT=""
+DS_LAST_STATUS_KEY=""
+DS_LAST_HINTS_KEY=""
 
-term_cols()  { stty size 2>/dev/null | awk '{print $2}'; }
-term_lines() { stty size 2>/dev/null | awk '{print $1}'; }
+# 仪表盘四周留白。横向默认 2 列、纵向默认 1 行，可通过环境变量调整。
+DS_PAD_X="${POWER_SWITCH_PAD_X:-2}"
+DS_PAD_Y="${POWER_SWITCH_PAD_Y:-1}"
+case "$DS_PAD_X" in ""|*[!0-9]*) DS_PAD_X=2 ;; esac
+case "$DS_PAD_Y" in ""|*[!0-9]*) DS_PAD_Y=1 ;; esac
+[ "$DS_PAD_X" -gt 20 ] && DS_PAD_X=20
+[ "$DS_PAD_Y" -gt 5 ] && DS_PAD_Y=5
+
+term_cols() {
+    local size="" value=""
+    size=$(stty size < /dev/tty 2>/dev/null || true)
+    value=${size#* }
+    case "$value" in ""|*[!0-9]*) value=$(tput cols 2>/dev/null || true) ;; esac
+    case "$value" in ""|*[!0-9]*) value="${COLUMNS:-80}" ;; esac
+    case "$value" in ""|*[!0-9]*|0) value=80 ;; esac
+    printf '%s' "$value"
+}
+
+term_lines() {
+    local size="" value=""
+    size=$(stty size < /dev/tty 2>/dev/null || true)
+    value=${size%% *}
+    case "$value" in ""|*[!0-9]*) value=$(tput lines 2>/dev/null || true) ;; esac
+    case "$value" in ""|*[!0-9]*) value="${LINES:-24}" ;; esac
+    case "$value" in ""|*[!0-9]*|0) value=24 ;; esac
+    printf '%s' "$value"
+}
+
+ds_clear_line() {
+    printf '\033[2K%*s' "$DS_PAD_X_ACTIVE" ''
+}
+
+ds_blank_line() {
+    ds_clear_line
+    printf '\n'
+}
+
+ds_fixed_line() {
+    local text="$1" plain w pad
+    plain=$(printf '%s' "$text" | sed $'s/\033\[[0-9;]*m//g')
+    w=$(disp_width "$plain")
+    pad=$((DS_WIDTH - w)); [ "$pad" -lt 0 ] && pad=0
+    printf '%*s%s%*s\n' "$DS_PAD_X_ACTIVE" '' "$text" "$pad" ''
+}
+
+ds_render_table_header() {
+    local row=$((DS_PAD_Y + 3))
+    if [ "$DS_ACTIVE_CONTENT_KEY" != "$DS_LAST_CONTENT_KEY" ]; then
+        printf '\033[%d;1H' "$row"
+        ds_fixed_line "$1"
+    fi
+    printf '\033[%d;1H' $((row + 1))
+}
+
+ds_invalidate_chrome() {
+    DS_LAST_CONTENT_KEY=""
+    DS_LAST_TOP_BAR_KEY=""
+    DS_LAST_TOP_RULE_LAYOUT=""
+    DS_LAST_FOOTER_LAYOUT=""
+    DS_LAST_STATUS_KEY=""
+    DS_LAST_HINTS_KEY=""
+}
 
 ds_enter() {
     DS_STTY=$(stty -g 2>/dev/null) || DS_STTY=""
     [ -n "$DS_STTY" ] && stty -icanon -echo min 1 time 0 2>/dev/null
     printf '\033[?1049h\033[?25l'        # 备用屏幕 + 隐藏光标
-    trap 'ds_exit; exit 130' INT TERM
+    ds_invalidate_chrome
+    trap 'exit 130' INT TERM HUP
+    trap 'ds_exit' EXIT
 }
 
 ds_exit() {
     [ -n "$DS_STTY" ] && stty "$DS_STTY" 2>/dev/null
     printf '\033[?25h\033[?1049l'        # 恢复光标 + 主屏幕
-    trap - INT TERM
+    trap - INT TERM HUP EXIT
 }
 
 ds_suspend() {  # 临时退出全屏（执行行输入表单）
@@ -1233,6 +1425,7 @@ ds_suspend() {  # 临时退出全屏（执行行输入表单）
 ds_resume() {
     printf '\033[?1049h\033[?25l'
     [ -n "$DS_STTY" ] && stty -icanon -echo min 1 time 0 2>/dev/null
+    ds_invalidate_chrome
 }
 
 # ds_collect_providers <0=全部|1=仅启用> → DS_P_NAMES 数组
@@ -1262,14 +1455,19 @@ ds_clamp() {
 
 # ds_row <是否光标行 0/1> <文本> — 选中行整行反色高亮（htop 风格）
 ds_row() {
+    local text="$2"
     if [ "$1" = "1" ]; then
         local plain w pad
-        plain=$(printf '%s' "$2" | sed $'s/\033\[[0-9;]*m//g')
+        plain=$(printf '%s' "$text" | sed $'s/\033\[[0-9;]*m//g')
         w=$(disp_width "$plain")
-        pad=$(( ${DS_COLS:-80} - 2 - w )); [ "$pad" -lt 0 ] && pad=0
-        printf '\033[2K\033[7m❯ %s%*s\033[0m\033[K\n' "$2" "$pad" ''
+        pad=$((DS_WIDTH - 2 - w)); [ "$pad" -lt 0 ] && pad=0
+        printf '%*s\033[7m❯ %s%*s\033[0m\n' "$DS_PAD_X_ACTIVE" '' "$text" "$pad" ''
     else
-        printf '\033[2K  %s\033[K\n' "$2"
+        local plain w pad
+        plain=$(printf '%s' "$text" | sed $'s/\033\[[0-9;]*m//g')
+        w=$(disp_width "$plain")
+        pad=$((DS_WIDTH - 2 - w)); [ "$pad" -lt 0 ] && pad=0
+        printf '%*s  %s%*s\n' "$DS_PAD_X_ACTIVE" '' "$text" "$pad" ''
     fi
 }
 
@@ -1277,12 +1475,35 @@ ds_render() {
     local cols rows avail
     cols=$(term_cols);  : "${cols:=80}"
     rows=$(term_lines); : "${rows:=24}"
-    avail=$((rows - 7)); [ "$avail" -lt 3 ] && avail=3
+    DS_ROWS=$rows
+    DS_PAD_X_ACTIVE=$DS_PAD_X
+    [ $((DS_PAD_X_ACTIVE * 2 + 40)) -gt "$cols" ] && DS_PAD_X_ACTIVE=0
+    DS_WIDTH=$((cols - DS_PAD_X_ACTIVE * 2))
+    avail=$((rows - DS_PAD_Y * 2 - 6)); [ "$avail" -lt 3 ] && avail=3
 
-    printf '\033[H'                       # 光标归位
-    DS_COLS=$cols
+    printf '\033[H'                        # 光标归位；逐行覆盖，避免整屏清空造成闪烁
+    DS_TOO_SMALL=0
+    if [ "$DS_WIDTH" -lt 68 ] || [ "$rows" -lt $((19 + DS_PAD_Y * 2)) ]; then
+        DS_TOO_SMALL=1
+        printf '\033[%d;1H' $((DS_PAD_Y + 1))
+        ds_clear_line
+        printf '%sPower Switch v%s%s\n' "$C_BOLD$C_CYN" "$PSW_VERSION" "$C_RST"
+        ds_blank_line
+        local size_msg
+        size_msg="终端空间不足：当前 ${cols}x${rows}，至少需要 $((68 + DS_PAD_X_ACTIVE * 2))x$((19 + DS_PAD_Y * 2))。"
+        ds_clear_line
+        printf '%s%s%s\n' "$C_YLW" "$(clip_text "$size_msg" "$DS_WIDTH")" "$C_RST"
+        ds_clear_line
+        printf '%s%s%s\n' "$C_DIM" "$(clip_text "请放大终端，调整后按任意键刷新；按 q 退出。" "$DS_WIDTH")" "$C_RST"
+        printf '\033[J'
+        DS_LAST_CONTENT_LINES=0
+        ds_invalidate_chrome
+        return 0
+    fi
+
+    printf '\033[%d;1H' $((DS_PAD_Y + 1))
     # ---- 顶栏: ⚡ 品牌 + 标签胶囊 + 右侧统计 ----
-    local sep; sep=$(printf '─%.0s' $(seq 1 "$cols") 2>/dev/null || printf -- '--------------------')
+    local sep; sep=$(repeat_text "─" "$DS_WIDTH")
     # 统计: 接入商数量 / 已配置 Agent 数
     local pcount=0 acount=0 n a
     for n in $(provider_list_names); do pcount=$((pcount+1)); done
@@ -1303,14 +1524,33 @@ ds_render() {
         i=$((i+1))
     done
     local rstyled rplain lw rw pad
-    rstyled="${C_DIM}接入商 ${pcount} · Agent ${acount}/4${C_RST} "
-    rplain="接入商 ${pcount} · Agent ${acount}/4 "
+    rstyled="${C_DIM}接入商 ${pcount} · Agent ${acount}/4${C_RST}"
+    rplain="接入商 ${pcount} · Agent ${acount}/4"
     lw=$(disp_width "$lplain"); rw=$(disp_width "$rplain")
-    pad=$((cols - lw - rw)); [ "$pad" -lt 1 ] && pad=1
-    printf '\033[2K%s%*s%s\033[K\n' "$lstyled" "$pad" '' "$rstyled"
-    printf '\033[2K%s━━━%s%s%s\n' "$C_GRN" "$C_DIM" "$(printf '─%.0s' $(seq 1 $((cols-3)) 2>/dev/null))" "$C_RST"
+    pad=$((DS_WIDTH - lw - rw))
+    if [ "$pad" -lt 1 ]; then
+        rstyled=""; rplain=""; rw=0
+        pad=$((DS_WIDTH - lw))
+    fi
+    [ "$pad" -lt 0 ] && pad=0
+    local top_bar_key="${DS_PAD_Y}:${DS_PAD_X_ACTIVE}:${DS_WIDTH}:${DS_TAB}:${pcount}:${acount}"
+    if [ "$top_bar_key" != "$DS_LAST_TOP_BAR_KEY" ]; then
+        printf '\033[%d;1H%*s%s%*s%s' \
+            $((DS_PAD_Y + 1)) "$DS_PAD_X_ACTIVE" '' "$lstyled" "$pad" '' "$rstyled"
+        DS_LAST_TOP_BAR_KEY="$top_bar_key"
+    fi
+    local top_rule_layout="${DS_PAD_Y}:${DS_PAD_X_ACTIVE}:${DS_WIDTH}"
+    if [ "$top_rule_layout" != "$DS_LAST_TOP_RULE_LAYOUT" ]; then
+        printf '\033[%d;1H%*s%s━━━%s%s%s' \
+            $((DS_PAD_Y + 2)) "$DS_PAD_X_ACTIVE" '' "$C_GRN" "$C_DIM" \
+            "$(repeat_text "─" $((DS_WIDTH-3)))" "$C_RST"
+        DS_LAST_TOP_RULE_LAYOUT="$top_rule_layout"
+    fi
+    printf '\033[%d;1H' $((DS_PAD_Y + 3))
 
     # ---- 内容区 ----
+    DS_CONTENT_LINES=0
+    DS_ACTIVE_CONTENT_KEY="${DS_VIEW}:${DS_TAB}"
     case "$DS_VIEW" in
         main)
             case "$DS_TAB" in
@@ -1324,25 +1564,57 @@ ds_render() {
         provider_actions) ds_render_provider_actions ;;
         form_provider)    ds_render_form_provider ;;
     esac
-    printf '\033[J'                       # 清除下方残余
+    # 只清理上一视图多出来的内容行，不触碰固定底栏。
+    if [ "$DS_LAST_CONTENT_LINES" -gt "$DS_CONTENT_LINES" ]; then
+        local clear_row=$((DS_PAD_Y + 3 + DS_CONTENT_LINES))
+        local clear_end=$((DS_PAD_Y + 3 + DS_LAST_CONTENT_LINES))
+        local footer_row=$((rows - DS_PAD_Y - 2))
+        [ "$clear_end" -gt "$footer_row" ] && clear_end=$footer_row
+        while [ "$clear_row" -lt "$clear_end" ]; do
+            printf '\033[%d;1H\033[2K' "$clear_row"
+            clear_row=$((clear_row+1))
+        done
+    fi
+    DS_LAST_CONTENT_LINES=$DS_CONTENT_LINES
+    DS_LAST_CONTENT_KEY=$DS_ACTIVE_CONTENT_KEY
 
-    # ---- 底栏（钉在屏幕底部）----
-    printf '\033[%d;1H' $((rows - 2))
-    printf '\033[2K%s%s%s\n' "$C_DIM" "$sep" "$C_RST"
+    # ---- 底栏（钉在屏幕底部；内容未变化时不重复重画）----
+    local footer_layout="${rows}:${DS_PAD_Y}:${DS_PAD_X_ACTIVE}:${DS_WIDTH}"
+    if [ "$footer_layout" != "$DS_LAST_FOOTER_LAYOUT" ]; then
+        printf '\033[%d;1H%*s%s%s%s' \
+            $((rows - DS_PAD_Y - 2)) "$DS_PAD_X_ACTIVE" '' "$C_DIM" "$sep" "$C_RST"
+        DS_LAST_FOOTER_LAYOUT="$footer_layout"
+        DS_LAST_STATUS_KEY=""
+        DS_LAST_HINTS_KEY=""
+    fi
     if [ -n "$DS_MSG" ]; then
         local mc="$C_YLW"
         case "$DS_MSG" in
             *✓*) mc="$C_GRN" ;; *✗*) mc="$C_RED" ;;
         esac
-        printf '\033[2K%s%s%s\033[K\n' "$mc" "$DS_MSG" "$C_RST"
+        ds_render_status_line $((rows - DS_PAD_Y - 1)) "$mc" "$DS_MSG"
     else
-        printf '\033[2K\033[K\n'
+        local meta
+        meta="数据目录: $PSW_HOME  │  JSON 后端: $(json_backend 2>/dev/null || echo '无')"
+        ds_render_status_line $((rows - DS_PAD_Y - 1)) "$C_DIM" "$meta"
     fi
-    ds_render_hints
+    ds_render_hints $((rows - DS_PAD_Y))
+}
+
+ds_render_status_line() {
+    local row="$1" color="$2" text w pad key
+    text=$(clip_text "$3" "$DS_WIDTH")
+    key="${row}:${DS_PAD_X_ACTIVE}:${DS_WIDTH}:${color}:${text}"
+    [ "$key" = "$DS_LAST_STATUS_KEY" ] && return 0
+    w=$(disp_width "$text")
+    pad=$((DS_WIDTH - w)); [ "$pad" -lt 0 ] && pad=0
+    printf '\033[%d;1H%*s%s%s%*s%s' \
+        "$row" "$DS_PAD_X_ACTIVE" '' "$color" "$text" "$pad" '' "$C_RST"
+    DS_LAST_STATUS_KEY="$key"
 }
 
 ds_render_hints() {
-    local h
+    local row="$1" h
     case "$DS_VIEW" in
         main)
             case "$DS_TAB" in
@@ -1358,12 +1630,22 @@ ds_render_hints() {
             h="[↑/↓] 移动  [Enter] 编辑/确认  [←/→] 切换选项  [Esc] 取消"
             ;;
     esac
-    printf '\033[2K\033[7m %s \033[K\033[0m' "$h"
+    h=$(clip_text "$h" $((DS_WIDTH - 2)))
+    local hw hpad
+    hw=$(disp_width "$h")
+    hpad=$((DS_WIDTH - hw - 2)); [ "$hpad" -lt 0 ] && hpad=0
+    local key="${row}:${DS_PAD_X_ACTIVE}:${DS_WIDTH}:${h}"
+    [ "$key" = "$DS_LAST_HINTS_KEY" ] && return 0
+    printf '\033[%d;1H%*s\033[7m %s%*s \033[0m' \
+        "$row" "$DS_PAD_X_ACTIVE" '' "$h" "$hpad" ''
+    DS_LAST_HINTS_KEY="$key"
 }
 
 ds_render_overview() {
     local avail="$1"
-    printf '\033[2K%s %s %s %s 应用时间%s\033[K\n' "$C_BOLD$C_CYN" "$(pw "Agent" 11)" "$(pw "接入商" 17)" "$(pw "模式" 11)" "$C_RST"
+    # 先约束光标再绘制，避免在首尾继续移动时出现一帧没有选中行。
+    ds_clamp 4 "$avail"
+    ds_render_table_header "${C_BOLD}${C_CYN} $(pw "Agent" 11) $(pw "接入商" 17) $(pw "模式" 11) 应用时间${C_RST}"
     local a prov mode at i=0
     for a in $AGENTS; do
         prov=$(kv_get "$STATE_DIR/$a" PROVIDER 2>/dev/null || true)
@@ -1371,6 +1653,8 @@ ds_render_overview() {
         at=$(kv_get "$STATE_DIR/$a" APPLIED_AT 2>/dev/null || true)
         local line
         if [ -n "$prov" ]; then
+            prov=$(clip_text "$prov" 17)
+            mode=$(clip_text "$mode" 11)
             line="$(pw "$a" 11) ${C_GRN}$(pw "$prov" 17)${C_FGDF} $(pw "$mode" 11) $at"
             if [ "$i" = "$DS_CURSOR" ]; then ds_row 1 "$line"; else ds_row 0 "$line"; fi
         else
@@ -1379,32 +1663,38 @@ ds_render_overview() {
         fi
         i=$((i+1))
     done
-    ds_clamp 4 "$avail"
-    printf '\033[2K\033[K\n'
-    printf '\033[2K%s数据目录: %s  │  JSON 后端: %s%s\033[K\n' "$C_DIM" "$PSW_HOME" "$(json_backend 2>/dev/null || echo '无')" "$C_RST"
+    DS_CONTENT_LINES=5
 }
 
 ds_render_providers() {
     local avail="$1"
     ds_collect_providers 0
     local n=${#DS_P_NAMES[@]}
-    printf '\033[2K%s %s %s %s Base URL / Model%s\033[K\n' "$C_BOLD$C_CYN" "$(pw "接入商" 13)" "$(pw "格式" 11)" "$(pw "状态" 3)" "$C_RST"
+    ds_render_table_header "${C_BOLD}${C_CYN} $(pw "接入商" 13) $(pw "格式" 11) $(pw "状态" 3) Base URL / Model${C_RST}"
     if [ "$n" -eq 0 ]; then
-        printf '\033[2K  %s(空 — 按 a 添加接入商)%s\033[K\n' "$C_DIM" "$C_RST"
+        ds_clear_line
+        printf '  %s(空 — 按 a 添加接入商)%s\n' "$C_DIM" "$C_RST"
         DS_CURSOR=0; DS_OFFSET=0
+        DS_CONTENT_LINES=2
         return 0
     fi
-    ds_clamp "$n" "$avail"
-    local i end=$((DS_OFFSET + avail))
+    local page_rows="$avail" show_scroll=0
+    if [ "$n" -gt "$avail" ]; then
+        show_scroll=1
+        page_rows=$((avail - 1)); [ "$page_rows" -lt 1 ] && page_rows=1
+    fi
+    ds_clamp "$n" "$page_rows"
+    local i end=$((DS_OFFSET + page_rows))
     [ "$end" -gt "$n" ] && end=$n
     i=$DS_OFFSET
     while [ "$i" -lt "$end" ]; do
-        local name="${DS_P_NAMES[$i]}" badge bu
+        local name="${DS_P_NAMES[$i]}" badge details detail_width
         provider_load "$name" || continue
         if [ "$P_ENABLED" = "1" ]; then badge="${C_GRN}●${C_FGDF}"; else badge="${C_DIM}○${C_FGDF}"; fi
-        bu="$P_BASE_URL"
-        [ ${#bu} -gt 36 ] && bu="${bu:0:33}..."
-        local line; line=$(printf '%-13s %-11s %b %-36s (%s)' "$name" "$P_FORMAT" "$badge" "$bu" "$P_MODEL")
+        name=$(clip_text "$name" 13)
+        detail_width=$((DS_WIDTH - 32)); [ "$detail_width" -lt 8 ] && detail_width=8
+        details=$(clip_text "$P_BASE_URL · $P_MODEL" "$detail_width")
+        local line; line=$(printf '%-13s %-11s %b %s' "$name" "$P_FORMAT" "$badge" "$details")
         if [ "$P_ENABLED" = "1" ]; then
             if [ "$i" = "$DS_CURSOR" ]; then ds_row 1 "$line"; else ds_row 0 "$line"; fi
         else
@@ -1412,11 +1702,15 @@ ds_render_providers() {
         fi
         i=$((i+1))
     done
-    [ "$n" -gt "$avail" ] && printf '\033[2K%s[%d-%d/%d]%s\033[K\n' "$C_DIM" $((DS_OFFSET+1)) "$end" "$n" "$C_RST"
+    if [ "$show_scroll" = "1" ]; then
+        ds_clear_line
+        printf '%s[%d-%d/%d]%s\n' "$C_DIM" $((DS_OFFSET+1)) "$end" "$n" "$C_RST"
+    fi
+    DS_CONTENT_LINES=$((1 + end - DS_OFFSET + show_scroll))
 }
 
 ds_render_help() {
-    cat <<'EOF' | while IFS= read -r l; do printf '\033[2K%s\033[K\n' "$l"; done
+    cat <<'EOF' | while IFS= read -r l; do ds_clear_line; printf '%s\n' "$l"; done
  标签页:
    概览     所有 Agent 当前状态; Enter 可为选中 Agent 切换接入商
    接入商   管理接入商: 添加/修改/删除/启用/禁用
@@ -1432,16 +1726,19 @@ ds_render_help() {
  命令行用法与配置文件机制见: psw help
  数据目录: providers/ state/ env.sh (POWER_SWITCH_HOME 可覆盖)
 EOF
+    DS_CONTENT_LINES=14
 }
 
 ds_render_pick_provider() {
     local avail="$1"
-    printf '\033[2K%s 为 Agent [%s] 选择接入商:%s\033[K\n' "$C_CYN" "$DS_AGENT" "$C_RST"
+    ds_clear_line
+    printf '%s 为 Agent [%s] 选择接入商:%s\n' "$C_CYN" "$DS_AGENT" "$C_RST"
     ds_collect_providers 1
     local n=${#DS_P_NAMES[@]} rows=$(( ${#DS_P_NAMES[@]} + 1 ))
     ds_clamp "$rows" "$avail"
     if [ "$n" -eq 0 ]; then
-        printf '\033[2K  %s(无已启用接入商，请到「接入商」标签添加)%s\033[K\n' "$C_DIM" "$C_RST"
+        ds_clear_line
+        printf '  %s(无已启用接入商，请到「接入商」标签添加)%s\n' "$C_DIM" "$C_RST"
     fi
     local i end=$((DS_OFFSET + avail))
     [ "$end" -gt "$rows" ] && end=$rows
@@ -1452,31 +1749,43 @@ ds_render_pick_provider() {
             line="⊘ 关闭 (恢复 $DS_AGENT 默认配置)"
         else
             provider_load "${DS_P_NAMES[$i]}"
-            line=$(printf '%-13s %-11s %s  (%s)' "${DS_P_NAMES[$i]}" "$P_FORMAT" "$P_BASE_URL" "$P_MODEL")
+            local pname pdetails pwidth
+            pname=$(clip_text "${DS_P_NAMES[$i]}" 13)
+            pwidth=$((DS_WIDTH - 29)); [ "$pwidth" -lt 8 ] && pwidth=8
+            pdetails=$(clip_text "$P_BASE_URL · $P_MODEL" "$pwidth")
+            line=$(printf '%-13s %-11s %s' "$pname" "$P_FORMAT" "$pdetails")
         fi
         if [ "$i" = "$DS_CURSOR" ]; then ds_row 1 "$line"; else ds_row 0 "$line"; fi
         i=$((i+1))
     done
+    DS_CONTENT_LINES=$((1 + end - DS_OFFSET))
+    [ "$n" -eq 0 ] && DS_CONTENT_LINES=$((DS_CONTENT_LINES + 1))
 }
 
 ds_render_pick_mode() {
-    printf '\033[2K%s 选择 Claude 配置方式:%s\033[K\n' "$C_CYN" "$C_RST"
+    ds_clear_line
+    printf '%s 选择 Claude 配置方式:%s\n' "$C_CYN" "$C_RST"
     if [ "$DS_CURSOR" -gt 1 ]; then DS_CURSOR=0; fi
     if [ "$DS_CURSOR" = "0" ]; then ds_row 1 "settings 模式 (写入 ~/.claude/settings.json, 推荐)"; else ds_row 0 "settings 模式 (写入 ~/.claude/settings.json, 推荐)"; fi
     if [ "$DS_CURSOR" = "1" ]; then ds_row 1 "env 模式 (生成环境变量文件, 需 install-shell)"; else ds_row 0 "env 模式 (生成环境变量文件, 需 install-shell)"; fi
+    DS_CONTENT_LINES=3
 }
 
 ds_render_provider_actions() {
     provider_load "$DS_PROVIDER" || { DS_VIEW="main"; return 0; }
     local toggle
     if [ "$P_ENABLED" = "1" ]; then toggle="禁用"; else toggle="启用"; fi
-    printf '\033[2K%s 接入商 [%s]  %s  %s%s\033[K\n' "$C_CYN" "$DS_PROVIDER" "$P_FORMAT" "$P_BASE_URL" "$C_RST"
+    local summary
+    summary="接入商 [$DS_PROVIDER]  $P_FORMAT  $P_BASE_URL"
+    ds_clear_line
+    printf '%s %s%s\n' "$C_CYN" "$(clip_text "$summary" "$((DS_WIDTH - 1))")" "$C_RST"
     [ "$DS_CURSOR" -gt 2 ] && DS_CURSOR=0
     local items=("$toggle 该接入商" "修改" "删除")
     local i
     for i in 0 1 2; do
         if [ "$i" = "$DS_CURSOR" ]; then ds_row 1 "${items[$i]}"; else ds_row 0 "${items[$i]}"; fi
     done
+    DS_CONTENT_LINES=4
 }
 
 #-------------------------------------------------------------------------------
@@ -1545,6 +1854,7 @@ ds_cycle_preset() {
 ds_form_row() {
     local idx="$1" label="$2" val="$3" secret="${4:-0}" disabled="${5:-0}"
     [ "$secret" = "1" ] && [ -n "$val" ] && val="********"
+    val=$(clip_text "$val" $((DS_WIDTH - 16)))
     if [ "$disabled" = "1" ]; then
         ds_row 0 "${C_DIM}$(pw "$label" 12) ${val}${C_RST}"
     elif [ "$DS_FORM_FIELD" = "$idx" ]; then
@@ -1557,6 +1867,7 @@ ds_form_row() {
 # ds_choice_row <字段号> <标签> <值> [disabled] — 选项字段行（‹ › 提示可切换）
 ds_choice_row() {
     local idx="$1" label="$2" val="$3" disabled="${4:-0}"
+    val=$(clip_text "$val" $((DS_WIDTH - 20)))
     if [ "$disabled" = "1" ]; then
         ds_row 0 "${C_DIM}$(pw "$label" 12) ${val}${C_RST}"
     elif [ "$DS_FORM_FIELD" = "$idx" ]; then
@@ -1569,8 +1880,9 @@ ds_choice_row() {
 ds_render_form_provider() {
     local title="添加接入商"
     [ "$DS_FORM_MODE" = "edit" ] && title="修改接入商: $DS_FORM_EDITING"
-    printf '\033[2K%s %s%s\033[K\n' "$C_BOLD$C_CYN" "$title" "$C_RST"
-    printf '\033[2K\033[K\n'
+    ds_clear_line
+    printf '%s %s%s\n' "$C_BOLD$C_CYN" "$(clip_text "$title" "$((DS_WIDTH - 1))")" "$C_RST"
+    ds_blank_line
     local dis=0
     [ "$DS_FORM_MODE" = "edit" ] && dis=1
     ds_form_row   0 "名称"       "$DS_F_NAME"   0 "$dis"
@@ -1580,16 +1892,18 @@ ds_render_form_provider() {
     ds_form_row   4 "API Key"    "$DS_F_KEY"    1
     ds_form_row   5 "主模型"     "$DS_F_MODEL"
     ds_form_row   6 "小/快模型"  "$DS_F_SMALL"
-    ds_choice_row 7 "Codex wire" "$DS_F_WIRE"
-    printf '\033[2K\033[K\n'
+    ds_choice_row 7 "OpenAI API" "$DS_F_WIRE"
+    ds_blank_line
     # 按钮行
+    ds_clear_line
     if [ "$DS_FORM_FIELD" = "8" ]; then
-        printf '\033[2K  \033[7m 保存 \033[0m    取消  \033[K\n'
+        printf '  \033[7m 保存 \033[0m    取消\n'
     elif [ "$DS_FORM_FIELD" = "9" ]; then
-        printf '\033[2K    保存   \033[7m 取消 \033[0m\033[K\n'
+        printf '    保存   \033[7m 取消 \033[0m\n'
     else
-        printf '\033[2K%s    保存    取消%s\033[K\n' "$C_DIM" "$C_RST"
+        printf '%s    保存    取消%s\n' "$C_DIM" "$C_RST"
     fi
+    DS_CONTENT_LINES=12
 }
 
 # ds_form_input <NAME|BU|KEY|MODEL|SMALL> <标签> <secret 0/1> — 在底栏上方读取一行输入
@@ -1597,15 +1911,25 @@ ds_form_input() {
     local var="$1" label="$2" secret="$3" rows cur v=""
     rows=$(term_lines); : "${rows:=24}"
     cur=$(ds_form_get "$var")
-    [ "$secret" = "1" ] && [ -n "$cur" ] && cur="(已设置)"
-    printf '\033[%d;1H\033[2K%s%s:%s %s%s%s ' "$((rows-3))" "$C_GRN" "$label" "$C_RST" "$C_DIM" "$cur" "$C_RST"
+    if [ "$secret" = "1" ]; then
+        if [ -n "$cur" ]; then cur="已设置；留空保留，输入 - 清除"; else cur="留空表示不设置"; fi
+    fi
+    cur=$(clip_text "$cur" $((DS_WIDTH - 16)))
+    printf '\033[%d;1H\033[2K%*s%s%s:%s %s%s%s ' \
+        "$((rows - DS_PAD_Y - 3))" "$DS_PAD_X_ACTIVE" '' \
+        "$C_GRN" "$label" "$C_RST" "$C_DIM" "$cur" "$C_RST"
     printf '\033[?25h'
     [ -n "$DS_STTY" ] && stty "$DS_STTY" 2>/dev/null
     if [ "$secret" = "1" ]; then IFS= read -r -s v || v=""; else IFS= read -r v || v=""; fi
     [ -n "$DS_STTY" ] && stty -icanon -echo min 1 time 0 2>/dev/null
     printf '\033[?25l'
-    [ -n "$v" ] && ds_form_set "$var" "$v"
-    printf '\033[%d;1H\033[2K' "$((rows-3))"
+    if [ "$secret" = "1" ] && [ "$v" = "-" ]; then
+        ds_form_set "$var" ""
+        DS_MSG="API Key 已清除，保存后生效"
+    elif [ -n "$v" ]; then
+        ds_form_set "$var" "$v"
+    fi
+    printf '\033[%d;1H\033[2K' "$((rows - DS_PAD_Y - 3))"
 }
 
 ds_form_save() {
@@ -1686,6 +2010,11 @@ ds_handle_form() {
 
 ds_apply_provider() { # agent provider [mode]
     local out
+    provider_load "$2" || { DS_MSG="[✗] 接入商 '$2' 不存在"; return 1; }
+    if [ "$1" = "claude" ] && [ "$P_FORMAT" != "anthropic" ]; then
+        DS_MSG="[✗] Claude 仅支持 Anthropic 协议，请先修改接入商格式或配置协议转换网关"
+        return 1
+    fi
     if [ "$1" = "claude" ]; then
         out=$(cmd_agent_use "$1" "$2" --mode "${3:-settings}" 2>&1)
     else
@@ -1723,6 +2052,9 @@ ds_form() { # 挂起全屏执行行输入命令，恢复后回到全屏；子 sh
 ds_handle() {
     local key="$1"
     DS_MSG=""
+    if [ "$DS_TOO_SMALL" = "1" ]; then
+        case "$key" in q|Q|ESC) return 1 ;; *) return 0 ;; esac
+    fi
     case "$DS_VIEW" in
     #------------------------------------------------------------------ 主视图
     main)
@@ -2013,6 +2345,8 @@ power-switch (psw) v${PSW_VERSION} — AI Agent CLI 模型接入商管理
   psw menu                                 经典方向键菜单
   仪表盘按键: ←/→ 或 Tab/1/2/3 切换标签，↑/↓ 移动，Enter 确认，
               a/e/d 添加/修改/删除接入商，空格 启/停，q 退出
+  布局留白: POWER_SWITCH_PAD_X（左右，默认 2）
+            POWER_SWITCH_PAD_Y（上下，默认 1）
 
 接入商管理:
   psw provider list                          列出所有接入商
@@ -2020,8 +2354,11 @@ power-switch (psw) v${PSW_VERSION} — AI Agent CLI 模型接入商管理
   psw provider add [选项]                    添加接入商（无选项时交互式）
     --name N --preset P --format openai|anthropic
     --base-url URL --key KEY --model M --small-model M --wire-api responses|chat
+      wire_api 同时用于 Codex、OpenCode 与 Hermes；anthropic 格式时忽略
       预设: $PRESETS custom
-  psw provider edit <名称> [选项]            修改（无选项时交互式，选项同 add）
+  psw provider edit <名称> [选项]            修改（无选项时交互式）
+    --format openai|anthropic --base-url URL --key KEY
+    --model M --small-model M --wire-api responses|chat（--key - 清除 Key）
   psw provider remove <名称>                 删除
   psw provider enable <名称>                 启用
   psw provider disable <名称>                禁用
@@ -2047,7 +2384,8 @@ Agent 配置 (支持: $AGENTS):
 说明:
   - Claude Code 只支持 Anthropic 协议；openai 格式接入商需先经网关转换
   - 新版 Codex 只支持 Responses API；旧版可 psw provider edit <名称> --wire-api chat
-  - 每次修改配置文件前自动备份为 <文件>.psw-bak-<时间戳>
+  - OpenCode/Hermes 会按 wire_api 选择 Responses 或 Chat Completions
+  - 每次修改配置文件前自动备份为 <文件>.psw-bak-<时间戳>（重名自动追加序号）
   - 跨平台: Linux / macOS / Windows (Git Bash, MSYS2, Cygwin, WSL)
 EOF
 }
@@ -2067,27 +2405,27 @@ main() {
             local sub="$1"; shift
             case "$sub" in
                 list|ls)        cmd_provider_list ;;
-                show)           [ $# -ge 1 ] || die "用法: psw provider show <名称>"; cmd_provider_show "$1" ;;
+                show)           [ $# -eq 1 ] || die "用法: psw provider show <名称>"; cmd_provider_show "$1" ;;
                 add)            cmd_provider_add "$@" ;;
                 edit)           [ $# -ge 1 ] || die "用法: psw provider edit <名称> [选项]"; cmd_provider_edit "$@" ;;
-                remove|rm|del)  [ $# -ge 1 ] || die "用法: psw provider remove <名称>"; cmd_provider_remove "$1" ;;
-                enable)         [ $# -ge 1 ] || die "用法: psw provider enable <名称>"; cmd_provider_enable "$1" 1 ;;
-                disable)        [ $# -ge 1 ] || die "用法: psw provider disable <名称>"; cmd_provider_disable "$1" 0 ;;
+                remove|rm|del)  [ $# -eq 1 ] || die "用法: psw provider remove <名称>"; cmd_provider_remove "$1" ;;
+                enable)         [ $# -eq 1 ] || die "用法: psw provider enable <名称>"; cmd_provider_enable "$1" 1 ;;
+                disable)        [ $# -eq 1 ] || die "用法: psw provider disable <名称>"; cmd_provider_disable "$1" ;;
                 *) die "未知 provider 子命令: $sub（见 psw help）" ;;
             esac
             ;;
         agent|a|agents)
             [ $# -ge 1 ] || { cmd_agent_status all; return 0; }
             case "$1" in
-                status) cmd_agent_status all ;;
+                status) [ $# -eq 1 ] || die "用法: psw agent status"; cmd_agent_status all ;;
                 *)
                     local agent="$1"; shift
                     [ $# -ge 1 ] || die "用法: psw agent <agent> use|off|status ..."
                     local sub="$1"; shift
                     case "$sub" in
                         use)    [ $# -ge 1 ] || die "用法: psw agent $agent use <接入商> [选项]"; cmd_agent_use "$agent" "$@" ;;
-                        off)    cmd_agent_off "$agent" ;;
-                        status) cmd_agent_status "$agent" ;;
+                        off)    [ $# -eq 0 ] || die "用法: psw agent $agent off"; cmd_agent_off "$agent" ;;
+                        status) [ $# -eq 0 ] || die "用法: psw agent $agent status"; cmd_agent_status "$agent" ;;
                         *) die "未知 agent 子命令: $sub（use|off|status）" ;;
                     esac
                     ;;

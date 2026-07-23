@@ -1,6 +1,6 @@
 # Agent CLI 自定义模型接入配置调研
 
-> 调研时间：2026-07。本文是 power-switch 脚本各 Agent 适配器的设计依据。
+> 最近核对：2026-07-23。本文是 power-switch 脚本各 Agent 适配器的设计依据。
 > 信息来源见各节末尾。
 
 ## 总览
@@ -45,7 +45,8 @@
 ```
 
 **注意**：OpenAI 格式端点不能直接配，需 One-API / LiteLLM 等网关转换为 Anthropic 协议。
-power-switch 写入时必须**合并** `.env`，保留用户已有的 `hooks`、`theme` 等配置。
+power-switch 写入时必须**合并** `env` 对象，保留用户已有的 `hooks`、`theme` 等配置。
+CLI 与仪表盘都会拒绝把 OpenAI 格式接入商直接应用到 Claude Code。
 
 来源：https://code.claude.com/docs/en/settings ，https://code.claude.com/docs/en/env-vars
 
@@ -80,6 +81,7 @@ TOML 顶层键（`model`、`model_provider`）必须出现在任何 `[section]` 
 Codex **不支持 Anthropic 原生协议**。
 
 来源：https://learn.chatgpt.com/docs/config-file/config-advanced ，
+https://learn.chatgpt.com/docs/config-file/config-reference ，
 https://github.com/openai/codex/blob/main/codex-rs/model-provider-info/src/lib.rs
 
 ## 3. OpenCode
@@ -113,6 +115,10 @@ Responses API 用 `@ai-sdk/openai`）：
 自定义 Anthropic 兼容 provider：同一结构，`npm` 换成 `@ai-sdk/anthropic`。
 当前模型选择写为顶层 `"model": "<provider>/<model>"`。
 
+power-switch 对 OpenAI 格式接入商按 `wire_api` 选择包：`responses` 使用
+`@ai-sdk/openai`，`chat` 使用 `@ai-sdk/openai-compatible`；Anthropic 格式始终使用
+`@ai-sdk/anthropic`。
+
 来源：https://opencode.ai/docs/providers/ ，https://opencode.ai/docs/config/
 
 ## 4. Hermes（NousResearch/hermes-agent）
@@ -124,9 +130,10 @@ GitHub: https://github.com/NousResearch/hermes-agent （注意 `hermes-agent.app
 - `~/.hermes/config.yaml` — 非敏感设置
 - `~/.hermes/.env` — 密钥
 
-官方原文："When `base_url` is set, Hermes ignores the provider and calls that endpoint
-directly (using `api_key` or `OPENAI_API_KEY` for auth)." 端点路径含 `/anthropic` 时
-自动走 Anthropic 格式。
+设置 `base_url` 后，Hermes 会直连该端点，并使用 `api_key` 或 `OPENAI_API_KEY`
+认证。Hermes 可根据端点自动判断协议，也支持通过 `api_mode` 显式指定
+`chat_completions`、`codex_responses` 或 `anthropic_messages`。power-switch 使用显式
+`api_mode`，避免非标准网关 URL 被误判。
 
 ```yaml
 model:
@@ -134,12 +141,17 @@ model:
   provider: custom
   base_url: https://api.minimax.io/anthropic
   api_key: sk-...
+  api_mode: anthropic_messages
 ```
 
-交互式切换命令：`hermes model`。
+交互式切换命令：`hermes model`。Hermes 官方建议敏感信息优先放在 `~/.hermes/.env`；
+power-switch 当前为便于独立切换，将 Key 写入权限为 `600` 的 `config.yaml`。
+协议映射为：Anthropic 格式 → `anthropic_messages`；OpenAI Responses →
+`codex_responses`；OpenAI Chat Completions → `chat_completions`。
 
 来源：https://github.com/NousResearch/hermes-agent ，
-https://hermes-agent.nousresearch.com/docs/user-guide/configuration
+https://hermes-agent.nousresearch.com/docs/user-guide/configuration ，
+https://hermes-agent.nousresearch.com/docs/user-guide/configuring-models
 
 ## 5. 常见接入商端点（power-switch 预设）
 
@@ -161,4 +173,8 @@ https://hermes-agent.nousresearch.com/docs/user-guide/configuration
 - macOS 自带 bash 3.2：避免关联数组、`mapfile`、`${var^^}`、负数子串偏移等 bash 4+ 特性。
 - JSON 编辑按 `jq → python3 → node` 顺序探测可用后端；TOML/YAML 用 awk 做行级手术，
   只管理脚本自己写入的段落，其余内容原样保留。
+- Codex provider ID 直接保留合法接入商名称；环境变量名使用
+  `PSW2_<名称的 ASCII 十六进制>_API_KEY` 可逆编码，避免名称归一化碰撞，并兼容
+  Windows 环境变量不区分大小写的行为。无歧义时同时生成 1.0.x 旧变量名，保证已有
+  Codex 配置在重新应用前仍可读取 Key。
 - 每次写配置前备份为 `<文件>.psw-bak-<时间戳>`。
